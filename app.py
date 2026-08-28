@@ -146,5 +146,5 @@ if user_input := st.chat_input("Type your clinical response..."):
         {"role": "assistant", "content": bot_reply}
     )
 
-        if "last_hint" in st.session_state:
+    if "last_hint" in st.session_state:
             st.info(st.session_state.last_hint)
