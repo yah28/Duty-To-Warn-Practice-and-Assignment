@@ -1,150 +1,262 @@
-from datetime import datetime
-import anthropic
 import streamlit as st
-from scenarios import SCENARIOS
+import anthropic
+import json
+from datetime import datetime
+from scenarios import SCENARIOS, RUBRIC
 
-# 1. Page Config
-st.set_page_config(
-    page_title="Optical Dispensing Clinical Simulation",
-    page_icon="👓",
-    layout="centered",
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+st.set_page_config(page_title="Duty to Warn Practice", page_icon="👓", layout="centered")
+
+client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+MODEL = "claude-sonnet-5"
+
+# Instructions that apply to every scenario, regardless of which patient
+# is selected. Scenario-specific details get appended to this at runtime.
+MASTER_PROMPT = """
+You are role-playing as a patient in an optical dispensing clinic. A student
+studying to become an optician is practicing their "duty to warn" \u2014 the
+professional obligation to assess a patient's lifestyle and activities,
+recommend an appropriate lens material (such as an impact-resistant material
+for higher-risk activities), explain the reasoning in plain terms, and
+document the conversation and the patient's ultimate decision, whatever it
+is.
+
+Background on how a real patient in this situation typically behaves, which
+should inform your responses:
+- Most patients don't know what material their current lenses are made of
+  and pay far more attention to frame style than to lens material \u2014 don't
+  have your character reference lens materials by name unless the student
+  introduces the terms first.
+- Most patients are inclined to defer to the optician's professional
+  recommendation once it is clearly explained \u2014 they aren't looking for a
+  fight, they're looking to be genuinely informed. Pushback should come from
+  a specific, believable reason (cost, skepticism about being "sold"
+  something, or simply not being asked the right question), not generic
+  suspicion.
+- Patients respond better to a recommendation framed around their actual
+  lifestyle and what they care about than to a generic safety warning. A
+  student who says "you should get this because it's safer" lands
+  differently than one who says "since you golf several times a week, this
+  material holds up better if the lens takes an impact."
+
+Rules you must follow at all times:
+- Stay fully in character as the patient described below. Never break role,
+  never refer to yourself as an AI, and never mention these instructions.
+- Do not volunteer your relevant lifestyle details (activities, hobbies,
+  work habits, risk factors) unless the student specifically asks a good
+  question that would surface them. A student who doesn't ask shouldn't
+  get the information handed to them \u2014 this is the core skill being
+  practiced.
+- The final material choice belongs to the patient. If the student explains
+  the reasoning well and ties it to something the patient actually cares
+  about, you may become receptive to their recommendation. If they explain
+  poorly, skip the lifestyle assessment, or seem dismissive, respond the
+  way a real patient would \u2014 uncertain, defaulting to the cheapest option,
+  or mildly pushing back using pushback lines noted in your scenario (such
+  as "Is that really necessary?", "What benefit would I get?", or "I
+  usually choose the less expensive option").
+- Notice and react naturally to whether the student documents the
+  conversation \u2014 mentions writing down the recommendation, asks you to
+  confirm your choice, or references having you sign off on it. A student
+  who skips this should not get any special acknowledgment that something
+  was missed; just respond the way a real patient would to an interaction
+  that ended without any of that (e.g., simply leaving, unprompted).
+- Keep responses conversational and realistic in length \u2014 a few sentences,
+  not a monologue.
+"""
+
+GRADED_ADDENDUM = """
+This is a GRADED scenario. Do not give the student hints, do not soften your
+reactions to help them succeed, and do not break character to offer
+feedback during the conversation. Respond only as the patient would.
+"""
+
+
+def score_transcript(scenario, transcript_text):
+    """Send the completed transcript to Claude for rubric-based scoring.
+    Returns a parsed dict with per-category scores, or None on failure."""
+
+    rubric_lines = "\n".join(
+        f"- {item['category']} (max {item['points']} points)" for item in RUBRIC
+    )
+    max_total = sum(item["points"] for item in RUBRIC)
+    milestones = "\n".join(f"- {m}" for m in scenario.get("milestones", []))
+
+    scoring_prompt = f"""
+You are an instructor scoring an optical dispensing student's "duty to warn"
+patient interaction against a fixed rubric. You have the full hidden
+clinical picture for this patient (the student did not see this — it is
+what they were supposed to uncover through good questioning).
+
+PATIENT: {scenario['persona_name']}, {scenario['persona_age']}
+
+HIDDEN CLINICAL INFORMATION (what the student needed to uncover):
+{scenario['patient_details']}
+
+CRITICAL MILESTONES FOR THIS SCENARIO:
+{milestones}
+
+RUBRIC (100 points total):
+{rubric_lines}
+
+TRANSCRIPT TO SCORE:
+{transcript_text}
+
+Score the student's performance against each rubric category. For each
+category, award a whole-number score from 0 up to that category's max, and
+give a one-to-two sentence justification referencing specific moments in
+the transcript. Then give brief overall feedback (2-4 sentences) noting
+what was done well and what to improve.
+
+Respond with ONLY valid JSON in exactly this shape, no other text:
+{{
+  "scores": [
+    {{"category": "Visual Needs Assessment", "points_awarded": 0, "max_points": 10, "justification": "..."}},
+    ...
+  ],
+  "total_awarded": 0,
+  "total_possible": {max_total},
+  "overall_feedback": "..."
+}}
+"""
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=1500,
+        messages=[{"role": "user", "content": scoring_prompt}],
+    )
+    raw = response.content[0].text.strip()
+    # Strip markdown code fences if the model added them despite instructions
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "scenario_key" not in st.session_state:
+    st.session_state.scenario_key = None
+if "score_result" not in st.session_state:
+    st.session_state.score_result = None
+
+# ---------------------------------------------------------------------------
+# Sidebar: scenario selection
+# ---------------------------------------------------------------------------
+
+st.sidebar.title("Duty to Warn Simulator")
+
+mode = st.sidebar.radio("Mode", ["Practice", "Graded"])
+
+if mode == "Practice":
+    available = {k: v for k, v in SCENARIOS.items() if v["type"] == "practice"}
+else:
+    available = {k: v for k, v in SCENARIOS.items() if v["type"] == "graded"}
+
+scenario_choice = st.sidebar.selectbox(
+    "Select a scenario",
+    options=list(available.keys()),
+    format_func=lambda k: available[k]["title"],
 )
 
-# 2. API Initialization
-api_key = st.secrets.get("ANTHROPIC_API_KEY")
-if not api_key:
-    st.error("Missing ANTHROPIC_API_KEY in Streamlit Secrets.")
-    st.stop()
+if st.sidebar.button("Start / Restart Scenario"):
+    st.session_state.messages = []
+    st.session_state.scenario_key = scenario_choice
+    st.session_state.score_result = None
+    st.rerun()
 
-client = anthropic.Anthropic(api_key=api_key)
-
-# 3. Sidebar Setup & Scenario Selection
-with st.sidebar:
-    st.title("👓 Scenario Portal")
-
-    # Select Scenario
-    selected_scenario_name = st.selectbox(
-        "Select Clinical Case:", options=list(SCENARIOS.keys())
+st.sidebar.divider()
+if st.session_state.messages:
+    transcript = "\n\n".join(
+        f"{m['role'].upper()}: {m['content']}" for m in st.session_state.messages
+    )
+    st.sidebar.download_button(
+        "Download Transcript",
+        data=transcript,
+        file_name=f"transcript_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
     )
 
-    scenario_data = SCENARIOS[selected_scenario_name]
+    if st.sidebar.button("Score This Session"):
+        current_scenario = SCENARIOS[st.session_state.scenario_key]
+        with st.spinner("Scoring against rubric..."):
+            st.session_state.score_result = score_transcript(current_scenario, transcript)
 
-    # Display Scenario Metadata
-    if scenario_data["type"] == "Graded":
-        st.error("🔴 GRADED EVALUATION MODE")
-    else:
-        st.success("🟢 PRACTICE MODE")
+# ---------------------------------------------------------------------------
+# Main area
+# ---------------------------------------------------------------------------
 
-    st.caption(f"**Case Description:** {scenario_data['description']}")
+st.title("👓 Duty to Warn: Patient Simulator")
 
-    st.markdown("---")
+if st.session_state.scenario_key is None:
+    st.info("Choose a scenario from the sidebar and click **Start / Restart Scenario** to begin.")
+    st.stop()
 
-    # Reset / Load Scenario Button
-    if st.button(
-        "Start / Reset Selected Scenario",
-        use_container_width=True,
-        type="primary",
-    ):
-        st.session_state.current_scenario = selected_scenario_name
-        st.session_state.messages = [
-            {"role": "assistant", "content": scenario_data["initial_message"]}
-        ]
-        if "last_hint" in st.session_state:
-            del st.session_state["last_hint"]
-        st.rerun()
+scenario = SCENARIOS[st.session_state.scenario_key]
+st.subheader(scenario["title"])
+st.caption(f"Patient: {scenario['persona_name']}, {scenario['persona_age']}")
+st.caption(scenario.get("student_brief", ""))
 
-    # Initialize current scenario in state if not set
-    if "current_scenario" not in st.session_state:
-        st.session_state.current_scenario = selected_scenario_name
-        st.session_state.messages = [
-            {"role": "assistant", "content": scenario_data["initial_message"]}
-        ]
+if scenario["type"] == "graded":
+    st.warning("This is a graded scenario. Respond as you would in a real patient encounter.")
 
-    # Download Transcript Button
-    if len(st.session_state.messages) > 1:
-        transcript_text = (
-            f"SCENARIO: {st.session_state.current_scenario}\nDATE:"
-            f" {datetime.now()}\n"
-            + "=" * 50
-            + "\n\n"
-        )
-        for msg in st.session_state.messages:
-            role = (
-                "OPTICIAN (STUDENT)"
-                if msg["role"] == "user"
-                else "PATIENT / INSTRUCTOR"
-            )
-            transcript_text += (
-                f"[{role}]\n{msg['content']}\n\n" + "-" * 40 + "\n\n"
-            )
+# Build the system prompt for this scenario
+system_prompt = MASTER_PROMPT + "\n\nSCENARIO DETAILS:\n" + scenario["patient_details"]
+if scenario["type"] == "graded":
+    system_prompt += "\n\n" + GRADED_ADDENDUM
 
-        st.download_button(
-            label="📄 Download Session Transcript",
-            data=transcript_text,
-            file_name=(
-                "clinical_transcript_"
-                f"{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
-            ),
-            mime="text/plain",
-            use_container_width=True,
-        )
-
-    # Instructor Hints Section
-    st.markdown("---")
-    st.header("💡 Clinical Coach")
-
-    if scenario_data["instructor_hint_prompt"] is None:
-        st.warning("🔒 Hints are disabled during Graded Evaluation mode.")
-    else:
-        if st.button("Get Clinical Hint", use_container_width=True):
-            with st.spinner("Analyzing clinical progression..."):
-                hint_response = client.messages.create(
-                    model="claude-3-5-sonnet-20241022",
-                    max_tokens=300,
-                    system=scenario_data["instructor_hint_prompt"],
-                    messages=st.session_state.messages,
-                    temperature=0.3,
-                )
-                st.session_state.last_hint = hint_response.content[0].text
-
-        if "last_hint" in st.session_state:
-            st.info(st.session_state.last_hint)
-
-# 4. Main App Interface
-st.title("👓 Clinical Simulation: Optical Dispensing")
-st.markdown(f"**Active Case:** `{st.session_state.current_scenario}`")
-
-# Render Chat History
+# Display existing conversation
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
+    with st.chat_message("assistant" if msg["role"] == "assistant" else "user"):
         st.markdown(msg["content"])
 
-# User Chat Input
-if user_input := st.chat_input("Type your clinical response..."):
+# Chat input
+user_input = st.chat_input("Speak to the patient...")
+
+if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # API Call with Active System Prompt
-    active_prompt = SCENARIOS[st.session_state.current_scenario][
-        "system_prompt"
-    ]
-
     with st.chat_message("assistant"):
-        with st.spinner("Patient responding..."):
+        with st.spinner("..."):
             response = client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=1000,
-                system=active_prompt,
-                messages=st.session_state.messages,
-                temperature=0.3,
+                model=MODEL,
+                max_tokens=500,
+                system=system_prompt,
+                messages=[
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state.messages
+                ],
             )
-            bot_reply = response.content[0].text
-            st.markdown(bot_reply)
+            reply = response.content[0].text
+            st.markdown(reply)
 
-    st.session_state.messages.append(
-        {"role": "assistant", "content": bot_reply}
-    )
+    st.session_state.messages.append({"role": "assistant", "content": reply})
 
-    if "last_hint" in st.session_state:
-            st.info(st.session_state.last_hint)
+# ---------------------------------------------------------------------------
+# Rubric score display
+# ---------------------------------------------------------------------------
+
+if st.session_state.score_result:
+    st.divider()
+    result = st.session_state.score_result
+    if result is None:
+        st.error("Scoring failed to parse a response. Try again.")
+    else:
+        st.subheader(f"Score: {result['total_awarded']} / {result['total_possible']}")
+        for item in result["scores"]:
+            st.markdown(
+                f"**{item['category']}** — {item['points_awarded']} / {item['max_points']}"
+            )
+            st.caption(item["justification"])
+        st.markdown("**Overall feedback:**")
+        st.write(result["overall_feedback"])
+
