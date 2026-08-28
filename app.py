@@ -137,6 +137,47 @@ Respond with ONLY valid JSON in exactly this shape, no other text:
     except (json.JSONDecodeError, ValueError):
         return None
 
+
+def get_hint(scenario, messages):
+    """Give the student a gentle nudge toward an unexplored milestone,
+    without revealing hidden clinical information directly. Practice
+    scenarios only."""
+
+    milestones = "\n".join(f"- {m}" for m in scenario.get("milestones", []))
+    transcript_text = "\n\n".join(
+        f"{m['role'].upper()}: {m['content']}" for m in messages
+    ) if messages else "(no conversation yet)"
+
+    hint_prompt = f"""
+A student practicing "duty to warn" patient interviews is stuck and asked
+for a hint. You are coaching them, not playing the patient right now.
+
+CRITICAL MILESTONES FOR THIS SCENARIO:
+{milestones}
+
+CONVERSATION SO FAR:
+{transcript_text}
+
+Based on which milestones have and haven't been covered so far, give ONE
+short, encouraging hint (1-2 sentences) nudging the student toward the next
+area they should explore. Do NOT reveal any of the patient's hidden
+clinical information, hobbies, occupation, or history directly \u2014 only
+suggest the general direction or type of question to ask next (e.g., "Try
+asking more about what they do outside of work" rather than naming the
+specific hobby). If every milestone already looks covered based on the
+conversation, instead encourage them to move toward making and explaining
+their recommendation.
+
+Respond with just the hint text, nothing else.
+"""
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=150,
+        messages=[{"role": "user", "content": hint_prompt}],
+    )
+    return response.content[0].text.strip()
+
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
@@ -147,6 +188,8 @@ if "scenario_key" not in st.session_state:
     st.session_state.scenario_key = None
 if "score_result" not in st.session_state:
     st.session_state.score_result = None
+if "hint_text" not in st.session_state:
+    st.session_state.hint_text = None
 
 # ---------------------------------------------------------------------------
 # Sidebar: scenario selection
@@ -171,6 +214,7 @@ if st.sidebar.button("Start / Restart Scenario"):
     st.session_state.messages = []
     st.session_state.scenario_key = scenario_choice
     st.session_state.score_result = None
+    st.session_state.hint_text = None
     st.rerun()
 
 st.sidebar.divider()
@@ -206,6 +250,12 @@ st.caption(scenario.get("student_brief", ""))
 
 if scenario["type"] == "graded":
     st.warning("This is a graded scenario. Respond as you would in a real patient encounter.")
+else:
+    if st.button("💡 Get a Hint"):
+        with st.spinner("Thinking of a hint..."):
+            st.session_state.hint_text = get_hint(scenario, st.session_state.messages)
+    if st.session_state.hint_text:
+        st.info(st.session_state.hint_text)
 
 # Build the system prompt for this scenario
 system_prompt = MASTER_PROMPT + "\n\nSCENARIO DETAILS:\n" + scenario["patient_details"]
@@ -259,4 +309,3 @@ if st.session_state.score_result:
             st.caption(item["justification"])
         st.markdown("**Overall feedback:**")
         st.write(result["overall_feedback"])
-
